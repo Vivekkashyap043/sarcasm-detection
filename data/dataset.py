@@ -101,6 +101,19 @@ class MultimodalDataset(Dataset):
         if self._text_dim is None:
             self._text_dim = 384
 
+    @property
+    def video_dim(self):
+        """Dimension of the concatenated video feature (context + utterance)"""
+        return int(self._video_context_dim + self._video_utt_dim)
+
+    @property
+    def audio_dim(self):
+        return int(self._audio_dim)
+
+    @property
+    def text_dim(self):
+        return int(self._text_dim)
+
     def __len__(self):
         return len(self.df)
 

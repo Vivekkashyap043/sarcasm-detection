@@ -23,12 +23,29 @@ def set_seed(seed=42):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
-def collate_batch(batch):
-    vids = torch.stack([b["video"] for b in batch])
-    auds = torch.stack([b["audio"] for b in batch])
-    txts = torch.stack([b["text"] for b in batch])
-    labs = torch.stack([b["label"] for b in batch])
-    return vids, auds, txts, labs
+def make_collate(use_video=True, use_audio=False, use_text=False):
+    """Return a collate_fn that stacks only the modalities requested.
+
+    Returns a function that yields a tuple of tensors in the order (variable):
+      (video?), (audio?), (text?), labels
+    The presence/order of the modality tensors matches the booleans passed in.
+    """
+    def collate(batch):
+        parts = []
+        if use_video:
+            vids = torch.stack([b["video"] for b in batch])
+            parts.append(vids)
+        if use_audio:
+            auds = torch.stack([b["audio"] for b in batch])
+            parts.append(auds)
+        if use_text:
+            txts = torch.stack([b["text"] for b in batch])
+            parts.append(txts)
+        labs = torch.stack([b["label"] for b in batch])
+        parts.append(labs)
+        return tuple(parts)
+
+    return collate
 
 def train(args):
     set_seed(args.seed)
@@ -44,17 +61,46 @@ def train(args):
     train_n = n - val_n
     train_set, val_set = random_split(ds, [train_n, val_n])
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, collate_fn=collate_batch, num_workers=4)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, collate_fn=collate_batch, num_workers=2)
+    collate_fn = make_collate(use_video=args.use_video, use_audio=args.use_audio, use_text=args.use_text)
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4)
+    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=2)
 
-    # infer dims from one example
-    sample = ds[0] if not isinstance(ds, torch.utils.data.Subset) else ds.dataset[ds.indices[0]]
-    video_dim = sample["video"].shape[0]
-    audio_dim = sample["audio"].shape[0]
-    text_dim  = sample["text"].shape[0]
+    # infer dims from dataset attributes (safer if using Subset wrappers)
+    # MultimodalDataset exposes internal detected dims; fall back to a sample
+    try:
+        video_dim = getattr(ds, "video_dim", None)
+        audio_dim = getattr(ds, "audio_dim", None)
+        text_dim  = getattr(ds, "text_dim", None)
+    except Exception:
+        video_dim = audio_dim = text_dim = None
+
+    # If the user disabled video, ensure we set video_dim to None so the model
+    # won't create a video encoder. Otherwise infer dims from dataset/sample.
+    if not args.use_video:
+        video_dim = None
+
+    if (video_dim is None and args.use_video) or (args.use_audio and audio_dim is None) or (args.use_text and text_dim is None):
+        sample = None
+        if isinstance(ds, torch.utils.data.Subset):
+            # get a sample from the underlying dataset
+            sample = ds.dataset[ds.indices[0]]
+        else:
+            sample = ds[0]
+        if args.use_video and video_dim is None:
+            video_dim = sample["video"].shape[0]
+        if args.use_audio and audio_dim is None:
+            audio_dim = sample["audio"].shape[0]
+        if args.use_text and text_dim is None:
+            text_dim = sample["text"].shape[0]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MultimodalClassifier(video_dim, audio_dim, text_dim, hidden=args.hidden, num_classes=args.num_classes).to(device)
+    model = MultimodalClassifier(video_dim=video_dim if args.use_video else None,
+                                 audio_dim=audio_dim if args.use_audio else None,
+                                 text_dim=text_dim if args.use_text else None,
+                                 use_audio=args.use_audio,
+                                 use_text=args.use_text,
+                                 hidden=args.hidden,
+                                 num_classes=args.num_classes).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss()
 
@@ -62,9 +108,21 @@ def train(args):
     for epoch in range(1, args.epochs + 1):
         model.train()
         losses = []
-        for vids, auds, txts, labs in train_loader:
-            vids, auds, txts, labs = vids.to(device), auds.to(device), txts.to(device), labs.to(device)
-            logits = model(vids, auds, txts)
+        for batch in train_loader:
+            # unpack in the same order as collate: (video?), (audio?), (text?), labels
+            idx = 0
+            vids = None
+            auds = None
+            txts = None
+            if args.use_video:
+                vids = batch[idx].to(device); idx += 1
+            if args.use_audio:
+                auds = batch[idx].to(device); idx += 1
+            if args.use_text:
+                txts = batch[idx].to(device); idx += 1
+            labs = batch[idx].to(device)
+
+            logits = model(video=vids, audio=auds, text=txts)
             loss = criterion(logits, labs)
             optimizer.zero_grad()
             loss.backward()
@@ -75,9 +133,20 @@ def train(args):
         model.eval()
         preds, trues = [], []
         with torch.no_grad():
-            for vids, auds, txts, labs in val_loader:
-                vids, auds, txts, labs = vids.to(device), auds.to(device), txts.to(device), labs.to(device)
-                logits = model(vids, auds, txts)
+            for batch in val_loader:
+                idx = 0
+                vids = None
+                auds = None
+                txts = None
+                if args.use_video:
+                    vids = batch[idx].to(device); idx += 1
+                if args.use_audio:
+                    auds = batch[idx].to(device); idx += 1
+                if args.use_text:
+                    txts = batch[idx].to(device); idx += 1
+                labs = batch[idx].to(device)
+
+                logits = model(video=vids, audio=auds, text=txts)
                 p = torch.argmax(logits, dim=1).cpu().numpy()
                 preds.extend(p.tolist()); trues.extend(labs.cpu().numpy().tolist())
 
