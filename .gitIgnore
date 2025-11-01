@@ -1,0 +1,5 @@
+# Content of .gitignore
+/dataset/video/context_videos/
+/dataset/video/utterance_videos/
+/dataset/audio/utterance_audios/
+/dataset/audio/context_audios/
